@@ -1,25 +1,21 @@
 """
 app.py
 -------
-결함 탐지 데모용 Streamlit 앱 (단일 파일 버전).
-
-모델 로드 / 추론 / 바운딩박스 시각화 로직과 Streamlit UI를 한 파일에 담았습니다.
+결함 탐지 데모용 Streamlit 앱 (단일 파일 버전 + Gemini AI 해석 기능 추가).
 
 로컬 실행:
     streamlit run app.py
-
-동작:
-1. 사이드바에서 학습된 모델(best.pt) 경로와 confidence threshold를 설정
-2. 이미지를 업로드하면 predict_and_draw()로 추론
-3. 원본 / 탐지 결과 이미지를 나란히 보여주고, 상세 결과 표를 출력
 """
 from pathlib import Path
+import os
 
 import cv2
 import numpy as np
 import streamlit as st
 from ultralytics import YOLO
-
+# 2026년 기준 공식 최신 google-genai 라이브러리를 사용합니다.
+from google import genai
+from google.genai import types
 
 # ---------------------------------------------------------------------------
 # 결함 탐지 유틸리티 (모델 로드 / 추론 / 바운딩박스 시각화)
@@ -49,13 +45,7 @@ def load_model(weights_path):
 
 
 def draw_boxes(image, boxes, confs, class_ids, class_names, color=(0, 0, 255), thickness=2):
-    """
-    image      : BGR numpy array
-    boxes      : (N, 4) xyxy 좌표 배열
-    confs      : (N,) confidence 배열
-    class_ids  : (N,) 클래스 id 배열
-    class_names: {id: name} 딕셔너리 (model.names)
-    """
+    """바운딩 박스 시각화 함수"""
     annotated = image.copy()
     for (x1, y1, x2, y2), conf, cls_id in zip(boxes, confs, class_ids):
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
@@ -74,29 +64,7 @@ def draw_boxes(image, boxes, confs, class_ids, class_names, color=(0, 0, 255), t
 
 
 def predict_and_draw(model, image, conf=0.05, imgsz=320):
-    """
-    새 이미지에 대해 결함을 탐지하고 바운딩박스를 그려서 반환합니다.
-
-    Parameters
-    ----------
-    model : YOLO
-        load_model()으로 불러온 모델
-    image : str | Path | np.ndarray
-        이미지 경로 또는 BGR numpy array
-    conf  : float
-        confidence threshold
-    imgsz : int
-        추론 이미지 크기
-
-    Returns
-    -------
-    annotated_bgr : np.ndarray
-        바운딩박스가 그려진 BGR 이미지
-    result : ultralytics.engine.results.Results
-        원본 추론 결과 객체
-    summary : list[dict]
-        [{"class": str, "confidence": float, "bbox": [x1,y1,x2,y2]}, ...]
-    """
+    """새 이미지에 대해 결함을 탐지하고 바운딩박스를 그려서 반환합니다."""
     if isinstance(image, (str, Path)):
         image_bgr = imread(image)
         if image_bgr is None:
@@ -129,13 +97,54 @@ def predict_and_draw(model, image, conf=0.05, imgsz=320):
 
 
 # ---------------------------------------------------------------------------
+# Gemini API 분석 연동 로직
+# ---------------------------------------------------------------------------
+
+def analyze_defects_with_gemini(summary_data):
+    """YOLO 탐지 결과를 바탕으로 Gemini 모델에게 종합 분석 리포트를 요청합니다."""
+    # Streamlit Secret 또는 환경 변수에서 API 키를 가져옵니다.
+    api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    
+    if not api_key:
+        return "⚠️ Gemini API 키가 설정되지 않았습니다. 사이드바안내 또는 Streamlit secrets 설정을 확인해주세요."
+
+    try:
+        # 최신 google-genai SDK 가이드라인 준수
+        client = genai.Client(api_key=api_key)
+        
+        # 프롬프트 조립
+        prompt = f"""
+        당신은 제조 공정 전문 품질 관리(QC) 분석가입니다. 
+        비전 AI 모델(YOLO)이 제품 표면이나 외관에서 탐지한 결함 데이터 리스트를 바탕으로 전문가용 '결함 종합 분석 리포트'를 작성해 주세요.
+
+        [탐지 데이터 리스트]
+        {summary_data}
+
+        [요청 사항]
+        1. 발견된 결함들의 유형과 개수 요약
+        2. 신뢰도(Confidence)와 위치를 고려할 때 심각성 판단 (예: 특정 구역에 결함 밀집 여부 등)
+        3. 현장 작업자나 품질 검사원이 취해야 할 추천 조치 사항 (출하 중지, 재작업, 공정 설비 점검 등)
+        
+        친절하고 전문적인 한국어로 작성해 주고, 가독성 좋게 마크다운 형식을 활용해 주세요.
+        """
+
+        response = client.models.generate_content(
+            model='gemini-flash-latest', # 범용적이고 빠른 속도의 2.5-flash 모델 권장
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"❌ Gemini API 요청 중 오류가 발생했습니다: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="결함 탐지 데모", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="결함 탐지 및 AI 분석 데모", page_icon="🔍", layout="wide")
 
-st.title("🔍 결함 탐지 데모 (YOLOv8)")
-st.caption("학습된 YOLOv8 모델로 이미지 속 결함을 탐지하고 바운딩박스로 표시합니다.")
+st.title("🔍 결함 탐지 및 AI 분석 데모")
+st.caption("YOLOv8 모델로 결함을 탐지한 뒤, Gemini AI를 활용해 진단 및 조치 사항을 실시간으로 분석합니다.")
 
 with st.sidebar:
     st.header("⚙️ 설정")
@@ -148,10 +157,11 @@ with st.sidebar:
     imgsz = st.selectbox("이미지 크기 (imgsz)", options=[320, 416, 640], index=0)
 
     st.divider()
+    st.markdown("### 🔑 API 설정")
     st.caption(
-        "model/best.pt 파일이 커서 GitHub에 올리기 어렵다면 "
-        "Git LFS 또는 GitHub Release/외부 스토리지 URL 다운로드 방식을 권장합니다. "
-        "자세한 내용은 README를 참고하세요."
+        "Gemini 분석 기능을 사용하려면 `GEMINI_API_KEY`를 설정해야 합니다. "
+        "로컬 구동 시 프로젝트 루트에 `.streamlit/secrets.toml` 파일을 만들고 아래와 같이 입력하세요:\n\n"
+        "`GEMINI_API_KEY = \"YOUR_KEY_HERE\"`"
     )
 
 
@@ -179,6 +189,7 @@ if uploaded_file is not None:
                     model, image_bgr, conf=conf_threshold, imgsz=imgsz
                 )
 
+            # 1. 이미지 결과 나란히 배치
             col1, col2 = st.columns(2)
             with col1:
                 st.subheader("원본 이미지")
@@ -187,10 +198,24 @@ if uploaded_file is not None:
                 st.subheader("탐지 결과")
                 st.image(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-            st.subheader("📋 탐지 상세 결과")
-            if summary:
-                st.table(summary)
-            else:
-                st.info("탐지된 결함이 없습니다. 왼쪽 사이드바에서 threshold를 낮춰보세요.")
+            # 2. 하단 레이아웃 분할: 왼쪽(YOLO 상세 테이블), 오른쪽(Gemini AI 분석)
+            st.divider()
+            analysis_col1, analysis_col2 = st.columns([1, 1])
+
+            with analysis_col1:
+                st.subheader("📋 YOLO 탐지 상세 데이터")
+                if summary:
+                    st.table(summary)
+                else:
+                    st.info("탐지된 결함이 없습니다. 왼쪽 사이드바에서 threshold를 낮춰보세요.")
+
+            with analysis_col2:
+                st.subheader("🤖 Gemini AI 품질 리포트")
+                if summary:
+                    with st.spinner("Gemini가 결함 데이터를 분석하고 조치 사항을 생성하는 중..."):
+                        ai_report = analyze_defects_with_gemini(summary)
+                        st.markdown(ai_report)
+                else:
+                    st.success("✅ 탐지된 데이터가 없어 AI 종합 진단이 불필요합니다. 정상 제품으로 판단됩니다.")
 else:
     st.info("왼쪽 사이드바에서 모델 경로를 설정한 뒤, 이미지를 업로드하면 결과가 표시됩니다.")
